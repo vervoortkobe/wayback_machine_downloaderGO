@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cheggaaa/pb/v3"
+	"golang.org/x/net/html"
 )
 
 type WaybackDownloader struct {
@@ -75,7 +75,6 @@ func (w *WaybackDownloader) getRawListFromAPI(urlStr string, pageIndex *int) ([]
 
 	fullURL := fmt.Sprintf("%s?%s", apiURL, params.Encode())
 
-	// Debug: Print full URL
 	fmt.Printf("Full URL: %s\n", fullURL)
 
 	resp, err := http.Get(fullURL)
@@ -89,21 +88,15 @@ func (w *WaybackDownloader) getRawListFromAPI(urlStr string, pageIndex *int) ([]
 		return nil, fmt.Errorf("failed to read response body: %v", err)
 	}
 
-	// Debug: Print raw response body
-	// fmt.Printf("Raw response body: %s\n", string(body))
-
-	// Check if body is empty
 	if len(body) == 0 {
 		return nil, fmt.Errorf("received empty response body")
 	}
 
 	var rawData [][]string
 	if err := json.Unmarshal(body, &rawData); err != nil {
-		// More detailed error logging
 		return nil, fmt.Errorf("failed to unmarshal JSON: %v\nResponse body: %s", err, string(body))
 	}
 
-	// Skip header row if present
 	if len(rawData) > 0 && len(rawData[0]) > 0 && rawData[0][0] == "timestamp" {
 		rawData = rawData[1:]
 	}
@@ -122,7 +115,7 @@ func (w *WaybackDownloader) getRawListFromAPI(urlStr string, pageIndex *int) ([]
 }
 
 func (w *WaybackDownloader) downloadSnapshot(snapshot Snapshot, fileNum, totalFiles int) {
-	if err := w.downloadFile(snapshot, fileNum, totalFiles); err != nil {
+	if err := w.downloadRecursively(snapshot, fileNum, totalFiles); err != nil {
 		fmt.Printf("Error downloading %s: %v\n", snapshot.Original, err)
 	} else {
 		fmt.Printf("Downloaded %s\n", snapshot.Original)
@@ -144,52 +137,123 @@ func (w *WaybackDownloader) downloadFile(snapshot Snapshot, fileNum, totalFiles 
 	w.mu.Unlock()
 
 	fileURL := fmt.Sprintf("https://web.archive.org/web/%sid_/%s", snapshot.Timestamp, snapshot.Original)
+
+	fmt.Printf("Downloading: %s\n", fileURL)
+
 	resp, err := http.Get(fileURL)
 	if err != nil {
-		return err
+		return fmt.Errorf("HTTP GET error: %v", err)
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("HTTP status error: %s", resp.Status)
+	}
+
 	parsedURL, err := url.Parse(snapshot.Original)
 	if err != nil {
-		return err
+		return fmt.Errorf("URL parsing error: %v", err)
 	}
 
-	// Modify this part to handle static assets and paths more robustly
 	relativePath := parsedURL.Path
-	if relativePath == "" {
+	if relativePath == "" || relativePath == "/" {
 		relativePath = "index.html"
-	} else if strings.HasSuffix(relativePath, "/") {
-		relativePath += "index.html"
-	} else {
-		// Remove leading slash to create a proper relative path
-		relativePath = strings.TrimPrefix(relativePath, "/")
+	} else if !strings.Contains(filepath.Base(relativePath), ".") {
+		relativePath = filepath.Join(relativePath, "index.html")
 	}
 
-	// Use the full URL path to create a more accurate file structure
 	fullPath := filepath.Join(w.Directory, parsedURL.Host, snapshot.Timestamp, relativePath)
+
+	contentType := resp.Header.Get("Content-Type")
+	extension := getExtensionFromContentType(contentType)
+
+	if extension != "" && !strings.HasSuffix(fullPath, extension) {
+		fullPath = fullPath + extension
+	}
+
+	fmt.Printf("Saving to: %s\n", fullPath)
 
 	dir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+		return fmt.Errorf("directory creation error: %v", err)
 	}
 
 	file, err := os.Create(fullPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("file creation error: %v", err)
 	}
 	defer file.Close()
 
-	_, err = io.Copy(file, resp.Body)
+	written, err := io.Copy(file, resp.Body)
+	if err != nil {
+		return fmt.Errorf("file write error: %v", err)
+	}
+
+	fmt.Printf("File saved: %s (Size: %d bytes)\n", fullPath, written)
+
+	return nil
+}
+
+func (w *WaybackDownloader) downloadRecursively(snapshot Snapshot, fileNum, totalFiles int) error {
+	err := w.downloadFile(snapshot, fileNum, totalFiles)
 	if err != nil {
 		return err
 	}
 
-	w.mu.Lock()
-	fmt.Printf("[%d/%d] Downloaded: %s -> %s\n", fileNum, totalFiles, snapshot.Original, fullPath)
-	w.mu.Unlock()
+	parsedURL, _ := url.Parse(snapshot.Original)
+	fullPath := filepath.Join(w.Directory, parsedURL.Host, snapshot.Timestamp, "index.html")
+
+	if strings.HasSuffix(snapshot.Original, ".html") || strings.HasSuffix(fullPath, ".html") {
+		file, err := os.Open(fullPath)
+		if err != nil {
+			return err
+		}
+		defer file.Close()
+
+		doc, err := html.Parse(file)
+		if err != nil {
+			return err
+		}
+
+		var urls []string
+		var f func(*html.Node)
+		f = func(n *html.Node) {
+			if n.Type == html.ElementNode {
+				for _, a := range n.Attr {
+					if (a.Key == "src" || a.Key == "href") && strings.HasPrefix(a.Val, "/") {
+						urls = append(urls, a.Val)
+					}
+				}
+			}
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				f(c)
+			}
+		}
+		f(doc)
+
+		for _, u := range urls {
+			newSnapshot := Snapshot{
+				Timestamp: snapshot.Timestamp,
+				Original:  w.BaseURL + u,
+			}
+			w.downloadFile(newSnapshot, fileNum, totalFiles)
+		}
+	}
 
 	return nil
+}
+
+func getExtensionFromContentType(contentType string) string {
+	switch contentType {
+	case "text/html":
+		return ".html"
+	case "application/javascript":
+		return ".js"
+	case "text/css":
+		return ".css"
+	default:
+		return ""
+	}
 }
 
 func main() {
@@ -219,24 +283,12 @@ func main() {
 
 	fmt.Printf("Found %d snapshots to download\n", len(snapshots))
 
-	bar := pb.StartNew(len(snapshots))
-	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, downloader.ThreadsCount)
-
 	for i, snapshot := range snapshots {
-		wg.Add(1)
-		semaphore <- struct{}{}
-		go func(s Snapshot, fileNum int) {
-			defer wg.Done()
-			defer func() { <-semaphore }()
-			if err := downloader.downloadFile(s, fileNum, len(snapshots)); err != nil {
-				fmt.Printf("Error downloading %s: %v\n", s.Original, err)
-			}
-			bar.Increment()
-		}(snapshot, i+1)
+		err := downloader.downloadFile(snapshot, i+1, len(snapshots))
+		if err != nil {
+			fmt.Printf("Error downloading %s: %v\n", snapshot.Original, err)
+		}
 	}
 
-	wg.Wait()
-	bar.Finish()
 	fmt.Println("Download completed!")
 }
