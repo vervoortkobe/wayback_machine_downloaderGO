@@ -18,7 +18,7 @@ Or download the source code and install Go to run it yourself.
 
 For builds:  
 Windows:  
-`./wayback_machine_downloader -url https://example.com/ --from 20241129171543 --to 20241129171545`  
+`./wayback_machine_downloader.exe -url https://example.com/ --from 20241129171543 --to 20241129171545`  
 Linux:  
 `./wayback_machine_downloader -url https://example.com/ --from 20241129171543 --to 20241129171545`
 
