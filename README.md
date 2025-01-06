@@ -1,2 +1,2 @@
 # wayback_machine_downloaderGO
-Wayback_machine_downloader, but rewritten in Go
+Wayback_machine_downloader, but written in Go
