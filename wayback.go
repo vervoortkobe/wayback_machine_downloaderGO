@@ -133,11 +133,9 @@ func (w *WaybackDownloader) downloadFile(snapshot Snapshot, fileNum, totalFiles 
 		w.mu.Unlock()
 		return nil
 	}
-	w.downloadedTimestamps[snapshot.Timestamp] = true
 	w.mu.Unlock()
 
 	fileURL := fmt.Sprintf("https://web.archive.org/web/%sid_/%s", snapshot.Timestamp, snapshot.Original)
-
 	fmt.Printf("Downloading: %s\n", fileURL)
 
 	resp, err := http.Get(fileURL)
@@ -150,34 +148,42 @@ func (w *WaybackDownloader) downloadFile(snapshot Snapshot, fileNum, totalFiles 
 		return fmt.Errorf("HTTP status error: %s", resp.Status)
 	}
 
+	// Parse the original URL
 	parsedURL, err := url.Parse(snapshot.Original)
 	if err != nil {
 		return fmt.Errorf("URL parsing error: %v", err)
 	}
 
+	// Handle paths properly
 	relativePath := parsedURL.Path
 	if relativePath == "" || relativePath == "/" {
 		relativePath = "index.html"
-	} else if !strings.Contains(filepath.Base(relativePath), ".") {
-		relativePath = filepath.Join(relativePath, "index.html")
 	}
 
-	fullPath := filepath.Join(w.Directory, parsedURL.Host, snapshot.Timestamp, relativePath)
-
+	// Ensure the file extension is preserved
 	contentType := resp.Header.Get("Content-Type")
 	extension := getExtensionFromContentType(contentType)
 
-	if extension != "" && !strings.HasSuffix(fullPath, extension) {
-		fullPath = fullPath + extension
+	// Create the full path maintaining the original directory structure
+	fullPath := filepath.Join(w.Directory, parsedURL.Host, snapshot.Timestamp, relativePath)
+
+	// Only add extension if the file doesn't already have one
+	if !strings.Contains(filepath.Base(fullPath), ".") {
+		if extension != "" {
+			fullPath += extension
+		} else {
+			// Default to .html for unknown types
+			fullPath += ".html"
+		}
 	}
 
-	fmt.Printf("Saving to: %s\n", fullPath)
-
+	// Create all necessary directories
 	dir := filepath.Dir(fullPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("directory creation error: %v", err)
 	}
 
+	// Create and write the file
 	file, err := os.Create(fullPath)
 	if err != nil {
 		return fmt.Errorf("file creation error: %v", err)
@@ -190,7 +196,6 @@ func (w *WaybackDownloader) downloadFile(snapshot Snapshot, fileNum, totalFiles 
 	}
 
 	fmt.Printf("File saved: %s (Size: %d bytes)\n", fullPath, written)
-
 	return nil
 }
 
@@ -200,10 +205,15 @@ func (w *WaybackDownloader) downloadRecursively(snapshot Snapshot, fileNum, tota
 		return err
 	}
 
+	// Parse the original URL to get the file path
 	parsedURL, _ := url.Parse(snapshot.Original)
-	fullPath := filepath.Join(w.Directory, parsedURL.Host, snapshot.Timestamp, "index.html")
+	fullPath := filepath.Join(w.Directory, parsedURL.Host, snapshot.Timestamp, parsedURL.Path)
+	if parsedURL.Path == "" || parsedURL.Path == "/" {
+		fullPath = filepath.Join(filepath.Dir(fullPath), "index.html")
+	}
 
-	if strings.HasSuffix(snapshot.Original, ".html") || strings.HasSuffix(fullPath, ".html") {
+	// Only parse HTML files for additional resources
+	if strings.HasSuffix(fullPath, ".html") {
 		file, err := os.Open(fullPath)
 		if err != nil {
 			return err
@@ -215,13 +225,24 @@ func (w *WaybackDownloader) downloadRecursively(snapshot Snapshot, fileNum, tota
 			return err
 		}
 
+		// Collect all resource URLs
 		var urls []string
 		var f func(*html.Node)
 		f = func(n *html.Node) {
 			if n.Type == html.ElementNode {
 				for _, a := range n.Attr {
-					if (a.Key == "src" || a.Key == "href") && strings.HasPrefix(a.Val, "/") {
-						urls = append(urls, a.Val)
+					if a.Key == "src" || a.Key == "href" {
+						// Handle both absolute and relative paths
+						if strings.HasPrefix(a.Val, "/") || strings.HasPrefix(a.Val, "./") {
+							cleanPath := strings.TrimPrefix(a.Val, ".")
+							urls = append(urls, cleanPath)
+						} else if strings.HasPrefix(a.Val, "http") {
+							// Handle absolute URLs from the same domain
+							resourceURL, err := url.Parse(a.Val)
+							if err == nil && resourceURL.Host == parsedURL.Host {
+								urls = append(urls, resourceURL.Path)
+							}
+						}
 					}
 				}
 			}
@@ -231,12 +252,15 @@ func (w *WaybackDownloader) downloadRecursively(snapshot Snapshot, fileNum, tota
 		}
 		f(doc)
 
+		// Download each resource
 		for _, u := range urls {
 			newSnapshot := Snapshot{
 				Timestamp: snapshot.Timestamp,
 				Original:  w.BaseURL + u,
 			}
-			w.downloadFile(newSnapshot, fileNum, totalFiles)
+			if err := w.downloadFile(newSnapshot, fileNum, totalFiles); err != nil {
+				fmt.Printf("Error downloading resource %s: %v\n", u, err)
+			}
 		}
 	}
 
@@ -244,13 +268,23 @@ func (w *WaybackDownloader) downloadRecursively(snapshot Snapshot, fileNum, tota
 }
 
 func getExtensionFromContentType(contentType string) string {
-	switch contentType {
-	case "text/html":
+	switch {
+	case strings.Contains(contentType, "text/html"):
 		return ".html"
-	case "application/javascript":
+	case strings.Contains(contentType, "application/javascript"), strings.Contains(contentType, "text/javascript"):
 		return ".js"
-	case "text/css":
+	case strings.Contains(contentType, "text/css"):
 		return ".css"
+	case strings.Contains(contentType, "image/jpeg"):
+		return ".jpg"
+	case strings.Contains(contentType, "image/png"):
+		return ".png"
+	case strings.Contains(contentType, "image/gif"):
+		return ".gif"
+	case strings.Contains(contentType, "image/svg+xml"):
+		return ".svg"
+	case strings.Contains(contentType, "application/json"):
+		return ".json"
 	default:
 		return ""
 	}
